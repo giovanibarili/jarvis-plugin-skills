@@ -1,0 +1,10 @@
+{
+  "name": "jarvis-plugin-skills",
+  "version": "1.0.0",
+  "description": "Skill system — extensible procedural knowledge loaded on demand",
+  "author": "giovanibarili",
+  "entry": "pieces/index.ts",
+  "capabilities": {
+    "pieces": true
+  }
+}
