@@ -21,6 +21,7 @@ interface Skill {
   dir: string;
   description: string;
   whenToUse?: string;
+  triggers?: string[];
   argumentHint?: string;
   userInvocable: boolean;
   autoInvoke: boolean;
@@ -144,10 +145,10 @@ export class SkillManagerPiece implements Piece {
       .filter(s => s.autoInvoke) // exclude auto-invoke: false from catalog
       .map(s => {
         const hint = s.argumentHint ? ` ${s.argumentHint}` : "";
-        const desc = s.whenToUse
-          ? `${s.description}. ${s.whenToUse}`
-          : s.description;
-        return `- ${s.name}${hint}: ${desc}`;
+        const parts = [s.description];
+        if (s.whenToUse) parts.push(`Use when: ${s.whenToUse}`);
+        if (s.triggers?.length) parts.push(`Triggers: ${s.triggers.join(", ")}`);
+        return `- ${s.name}${hint}: ${parts.join(". ")}`;
       })
       .join("\n");
 
@@ -217,11 +218,18 @@ export class SkillManagerPiece implements Piece {
     const { meta, body } = parsed;
     if (!body) return null;
 
+    // Parse triggers (comma-separated or YAML list)
+    const rawTriggers = meta.triggers ?? meta["trigger"];
+    const triggers = rawTriggers
+      ? rawTriggers.split(",").map((t: string) => t.trim()).filter(Boolean)
+      : undefined;
+
     return {
       name: meta.name ?? dirName,
       dir: dirPath,
       description: meta.description ?? body.split("\n")[0].slice(0, 100),
       whenToUse: meta.when_to_use ?? meta["when-to-use"],
+      triggers,
       argumentHint: meta["argument-hint"],
       userInvocable: meta["user-invocable"] !== "false",
       autoInvoke: meta["auto-invoke"] !== "false",
@@ -300,6 +308,7 @@ export class SkillManagerPiece implements Piece {
           userInvocable: s.userInvocable,
           autoInvoke: s.autoInvoke,
           hint: s.argumentHint,
+          triggers: s.triggers,
         })),
         activeCount: this.activeSkills.size,
       })) as CapabilityHandler,
