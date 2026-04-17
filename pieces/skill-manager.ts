@@ -130,7 +130,8 @@ export class SkillManagerPiece implements Piece {
   private bus!: EventBus;
   private ctx: PluginContext;
   private skills = new Map<string, Skill>();
-  private activeSkills = new Map<string, ActiveSkill>();
+  /** Per-session active skills: Map<sessionId, Map<skillName, ActiveSkill>> */
+  private activeSkills = new Map<string, Map<string, ActiveSkill>>();
   private watcher?: ReturnType<typeof watch>;
   private debounceTimer?: ReturnType<typeof setTimeout>;
   private started = false;
@@ -139,8 +140,8 @@ export class SkillManagerPiece implements Piece {
     this.ctx = ctx;
   }
 
-  systemContext(): string {
-    // Catalog: always show available skills
+  systemContext(sessionId?: string): string {
+    // Catalog: always show available skills (same for all sessions)
     const catalog = [...this.skills.values()]
       .filter(s => s.autoInvoke) // exclude auto-invoke: false from catalog
       .map(s => {
@@ -152,10 +153,13 @@ export class SkillManagerPiece implements Piece {
       })
       .join("\n");
 
-    // Active skills: injected bodies
-    const active = [...this.activeSkills.values()]
-      .map(a => `<active_skill name="${a.name}">\n${a.processedBody}\n</active_skill>`)
-      .join("\n\n");
+    // Active skills: per-session
+    const sessionSkills = sessionId ? this.activeSkills.get(sessionId) : undefined;
+    const active = sessionSkills
+      ? [...sessionSkills.values()]
+          .map(a => `<active_skill name="${a.name}">\n${a.processedBody}\n</active_skill>`)
+          .join("\n\n")
+      : "";
 
     if (!catalog && !active) return "";
 
@@ -195,7 +199,7 @@ export class SkillManagerPiece implements Piece {
     if (!existsSync(SKILLS_DIR)) return;
 
     const dirs = readdirSync(SKILLS_DIR, { withFileTypes: true })
-      .filter(d => d.isDirectory());
+      .filter(d => d.isDirectory() && !d.name.startsWith("."));
 
     for (const dir of dirs) {
       const skillPath = join(SKILLS_DIR, dir.name, "SKILL.md");
@@ -240,15 +244,18 @@ export class SkillManagerPiece implements Piece {
 
   // ─── Activation ─────────────────────────────────────────
 
-  private async activateSkill(name: string, rawArgs: string): Promise<{ ok: boolean; message: string }> {
+  private async activateSkill(name: string, rawArgs: string, sessionId: string): Promise<{ ok: boolean; message: string }> {
     const skill = this.skills.get(name);
     if (!skill) return { ok: false, message: `Unknown skill: ${name}. Available: ${[...this.skills.keys()].join(", ")}` };
 
     const args = parseArgs(rawArgs);
-    let processed = substituteArgs(skill.body, args, skill.dir, "main");
+    let processed = substituteArgs(skill.body, args, skill.dir, sessionId);
     processed = await preprocessShell(processed, process.cwd(), skill.shell);
 
-    this.activeSkills.set(name, { name, processedBody: processed });
+    if (!this.activeSkills.has(sessionId)) {
+      this.activeSkills.set(sessionId, new Map());
+    }
+    this.activeSkills.get(sessionId)!.set(name, { name, processedBody: processed });
 
     return {
       ok: true,
@@ -256,9 +263,11 @@ export class SkillManagerPiece implements Piece {
     };
   }
 
-  private deactivateSkill(name: string): { ok: boolean; message: string } {
-    if (!this.activeSkills.has(name)) return { ok: false, message: `Skill ${name} is not active.` };
-    this.activeSkills.delete(name);
+  private deactivateSkill(name: string, sessionId: string): { ok: boolean; message: string } {
+    const sessionSkills = this.activeSkills.get(sessionId);
+    if (!sessionSkills?.has(name)) return { ok: false, message: `Skill ${name} is not active.` };
+    sessionSkills.delete(name);
+    if (sessionSkills.size === 0) this.activeSkills.delete(sessionId);
     return { ok: true, message: `Skill **${name}** deactivated.` };
   }
 
@@ -277,7 +286,8 @@ export class SkillManagerPiece implements Piece {
         required: ["name"],
       },
       handler: (async (input: Record<string, unknown>) => {
-        return this.activateSkill(String(input.name), String(input.arguments ?? ""));
+        const sessionId = String(input.__sessionId ?? "main");
+        return this.activateSkill(String(input.name), String(input.arguments ?? ""), sessionId);
       }) as CapabilityHandler,
     });
 
@@ -292,7 +302,8 @@ export class SkillManagerPiece implements Piece {
         required: ["name"],
       },
       handler: (async (input: Record<string, unknown>) => {
-        return this.deactivateSkill(String(input.name));
+        const sessionId = String(input.__sessionId ?? "main");
+        return this.deactivateSkill(String(input.name), sessionId);
       }) as CapabilityHandler,
     });
 
@@ -300,18 +311,22 @@ export class SkillManagerPiece implements Piece {
       name: "skill_list",
       description: "List all available skills with their activation status.",
       input_schema: { type: "object", properties: {} },
-      handler: (async () => ({
-        skills: [...this.skills.values()].map(s => ({
-          name: s.name,
-          description: s.description,
-          active: this.activeSkills.has(s.name),
-          userInvocable: s.userInvocable,
-          autoInvoke: s.autoInvoke,
-          hint: s.argumentHint,
-          triggers: s.triggers,
-        })),
-        activeCount: this.activeSkills.size,
-      })) as CapabilityHandler,
+      handler: (async (input: Record<string, unknown>) => {
+        const sessionId = String(input.__sessionId ?? "main");
+        const sessionSkills = this.activeSkills.get(sessionId);
+        return {
+          skills: [...this.skills.values()].map(s => ({
+            name: s.name,
+            description: s.description,
+            active: sessionSkills?.has(s.name) ?? false,
+            userInvocable: s.userInvocable,
+            autoInvoke: s.autoInvoke,
+            hint: s.argumentHint,
+            triggers: s.triggers,
+          })),
+          activeCount: sessionSkills?.size ?? 0,
+        };
+      }) as CapabilityHandler,
     });
   }
 
@@ -327,7 +342,8 @@ export class SkillManagerPiece implements Piece {
         hint: skill.argumentHint,
         source: "skills",
         handler: async (args: string) => {
-          const result = await this.activateSkill(skill.name, args);
+          // Slash commands come from the main chat — use "main" session
+          const result = await this.activateSkill(skill.name, args, "main");
           return { message: result.message, inject: result.ok ? "active" : undefined };
         },
       });
@@ -355,10 +371,14 @@ export class SkillManagerPiece implements Piece {
           this.scanSkills();
           this.refreshSlashCommands();
           // Re-process active skills if their source changed
-          for (const [name, active] of this.activeSkills) {
-            if (!this.skills.has(name)) {
-              this.activeSkills.delete(name);
+          // Clean up active skills for removed skill definitions
+          for (const [sessionId, sessionSkills] of this.activeSkills) {
+            for (const name of sessionSkills.keys()) {
+              if (!this.skills.has(name)) {
+                sessionSkills.delete(name);
+              }
             }
+            if (sessionSkills.size === 0) this.activeSkills.delete(sessionId);
           }
         }, 300);
       });
