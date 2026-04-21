@@ -12,7 +12,7 @@ Given the plugin is installed and enabled
 And ~/.jarvis/skills/ contains directories with SKILL.md files
 When I call skill_list
 Then the result should contain all valid skills from the directory
-And each skill should have name, description, active (boolean), userInvocable, autoInvoke, contextFork, and triggers
+And each skill should have name, description, active (boolean), userInvocable, autoInvoke, contextFork, injection, activation, and triggers
 And the skill count should match the number of valid SKILL.md files in ~/.jarvis/skills/
 ```
 
@@ -358,10 +358,77 @@ Then "ARGUMENTS: some input" should be appended at the end of the body
 Given skills exist in the system
 When I call skill_list
 Then the response should contain:
-  - skills: array with name, description, active, userInvocable, autoInvoke, contextFork, triggers
+  - skills: array with name, description, active, userInvocable, autoInvoke, contextFork, injection, activation, triggers
   - activeCount: number of currently active skills
   - activeTokens: estimated token count of all active skill bodies
   - limits: { maxSkills: 5, maxTokens: 25000 }
+```
+
+## Feature: Injection Modes
+
+### Scenario: Skill with injection: message is NOT in system prompt
+
+```gherkin
+Given a skill with injection: message exists and is active
+When I check the system prompt via session_get_system
+Then the <active_skill> block for that skill should NOT appear in the system prompt
+And the skill should still be listed as active in skill_list
+```
+
+**Validation command:**
+```
+1. Create test skill with injection: message
+2. skill_invoke(name="test-msg-inject")
+3. session_get_system(raw=true) → verify NO <active_skill name="test-msg-inject"> in blocks
+4. skill_list() → verify test-msg-inject is active: true
+5. Cleanup: skill_deactivate + remove test skill
+```
+
+### Scenario: Skill with injection: system-prompt appears in system prompt (default)
+
+```gherkin
+Given a skill with injection: system-prompt (or no injection field) is active
+When I check the system prompt via session_get_system
+Then the <active_skill> block for that skill SHOULD appear in the system prompt dynamic block
+```
+
+### Scenario: Activation message reflects injection mode
+
+```gherkin
+Given a skill with injection: message exists
+When I call skill_invoke for it
+Then the activation message should contain "Injected as message (cache-friendly)"
+Given a skill with injection: system-prompt exists
+When I call skill_invoke for it
+Then the activation message should contain "The skill instructions are now in your context"
+```
+
+## Feature: Activation Modes
+
+### Scenario: Bootstrap skill auto-activates on startup
+
+```gherkin
+Given a skill with activation: bootstrap exists
+When JARVIS starts (or the plugin restarts)
+Then that skill should be automatically active in the main session without any explicit invocation
+And skill_list should show it as active: true
+```
+
+**Validation command:**
+```
+1. Create test skill with activation: bootstrap
+2. Restart JARVIS or reload the plugin
+3. skill_list() → verify the bootstrap skill is active: true in main
+4. Cleanup: remove test skill
+```
+
+### Scenario: On-demand skill does NOT auto-activate
+
+```gherkin
+Given a skill with activation: on-demand (or no activation field) exists
+When JARVIS starts
+Then that skill should NOT be automatically active
+And it should only become active when explicitly invoked via skill_invoke or slash command
 ```
 
 ## Execution Checklist
@@ -371,6 +438,7 @@ Run these commands in order to validate the full lifecycle:
 ```
 1. skill_list()
    → Verify: all skills from ~/.jarvis/skills/ are listed, counts match
+   → Verify: each skill has injection and activation fields
 
 2. skill_invoke(name="file-preview")
    → Verify: ok=true, skill becomes active, appears in system prompt
@@ -411,4 +479,17 @@ Run these commands in order to validate the full lifecycle:
 13. Multiple actors independent state:
     actor-a activates file-preview, actor-b does NOT
     → actor-a reports 1 active, actor-b reports 0 → cleanup
+
+14. Injection mode — message:
+    Create test skill with injection: message → skill_invoke → verify NOT in system prompt
+    → verify IS active in skill_list → cleanup
+
+15. Injection mode — system-prompt (default):
+    skill_invoke(file-preview) → verify <active_skill> IS in system prompt → cleanup
+
+16. Activation mode — bootstrap:
+    Create test skill with activation: bootstrap → restart/reload → verify auto-active → cleanup
+
+17. Activation mode — on-demand (default):
+    Verify skills without activation: bootstrap are NOT auto-activated
 ```

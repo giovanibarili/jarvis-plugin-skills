@@ -20,6 +20,9 @@ const MAX_ACTIVE_TOKENS = 25_000; // ~100K chars / 4
 
 // ─── Skill types ────────────────────────────────────────────
 
+type InjectionMode = "system-prompt" | "message";
+type ActivationMode = "on-demand" | "bootstrap";
+
 interface Skill {
   name: string;
   dir: string;
@@ -30,6 +33,8 @@ interface Skill {
   userInvocable: boolean;
   autoInvoke: boolean;
   contextFork: boolean;
+  injection: InjectionMode;
+  activation: ActivationMode;
   shell: string;
   body: string;
 }
@@ -37,6 +42,7 @@ interface Skill {
 interface ActiveSkill {
   name: string;
   processedBody: string;
+  injection: InjectionMode;
 }
 
 // ─── YAML frontmatter parser ────────────────────────────────
@@ -253,11 +259,12 @@ export class SkillManagerPiece implements Piece {
       })
       .join("\n");
 
-    // Active skills: per-session
+    // Active skills: per-session — only system-prompt injection mode
     const sessionSkills = sessionId ? this.activeSkills.get(sessionId) : undefined;
     const active = sessionSkills
       ? [...sessionSkills.values()]
-          .map(a => `<active_skill name="${a.name}">\n${a.processedBody}\n</active_skill>`)
+          .filter(a => a.injection === "system-prompt")
+          .map(a => `<system-reminder>\n<active_skill name="${a.name}">\n${a.processedBody}\n</active_skill>\n</system-reminder>`)
           .join("\n\n")
       : "";
 
@@ -273,6 +280,16 @@ export class SkillManagerPiece implements Piece {
     return ctx;
   }
 
+  /**
+   * Get active skills that use message injection mode.
+   * These should be injected into the conversation history, not the system prompt.
+   */
+  getMessageInjectedSkills(sessionId: string): ActiveSkill[] {
+    const sessionSkills = this.activeSkills.get(sessionId);
+    if (!sessionSkills) return [];
+    return [...sessionSkills.values()].filter(a => a.injection === "message");
+  }
+
   async start(bus: EventBus): Promise<void> {
     if (this.started) return;
     this.started = true;
@@ -280,6 +297,7 @@ export class SkillManagerPiece implements Piece {
 
     this.scanSkills();
     this.restoreActiveSkills();
+    this.activateBootstrapSkills();
     this.registerCapabilities();
     this.registerSlashCommands();
     this.startWatcher();
@@ -334,6 +352,8 @@ export class SkillManagerPiece implements Piece {
       userInvocable: metaBool(meta["user-invocable"], true),
       autoInvoke: metaBool(meta["auto-invoke"], true),
       contextFork: metaBool(meta["context"], false) || metaStr(meta["context"]) === "fork",
+      injection: (metaStr(meta.injection) === "message" ? "message" : "system-prompt") as InjectionMode,
+      activation: (metaStr(meta.activation) === "bootstrap" ? "bootstrap" : "on-demand") as ActivationMode,
       shell: metaStr(meta.shell) ?? "bash",
       body,
     };
@@ -378,13 +398,17 @@ export class SkillManagerPiece implements Piece {
     if (!this.activeSkills.has(sessionId)) {
       this.activeSkills.set(sessionId, new Map());
     }
-    this.activeSkills.get(sessionId)!.set(name, { name, processedBody: processed });
+    this.activeSkills.get(sessionId)!.set(name, { name, processedBody: processed, injection: skill.injection });
 
     this.persistActiveSkills();
 
+    const injectionNote = skill.injection === "message"
+      ? " Injected as message (cache-friendly)."
+      : " The skill instructions are now in your context.";
+
     return {
       ok: true,
-      message: `Skill **${name}** activated.${args.length > 0 ? ` Args: ${args.join(" ")}` : ""} The skill instructions are now in your context.`,
+      message: `Skill **${name}** activated.${args.length > 0 ? ` Args: ${args.join(" ")}` : ""}${injectionNote}`,
     };
   }
 
@@ -466,12 +490,37 @@ export class SkillManagerPiece implements Piece {
           if (!this.activeSkills.has(sessionId)) {
             this.activeSkills.set(sessionId, new Map());
           }
-          this.activeSkills.get(sessionId)!.set(name, { name, processedBody: skill.body });
+          this.activeSkills.get(sessionId)!.set(name, { name, processedBody: skill.body, injection: skill.injection });
         }
       }
     } catch {
       // corrupted state file — start fresh
     }
+  }
+
+  /**
+   * Auto-activate skills with activation: bootstrap for the main session.
+   * Skips skills already active (from restore).
+   */
+  private activateBootstrapSkills(): void {
+    const sessionId = "main";
+    for (const skill of this.skills.values()) {
+      if (skill.activation !== "bootstrap") continue;
+      if (skill.contextFork) continue;
+
+      const sessionSkills = this.activeSkills.get(sessionId);
+      if (sessionSkills?.has(skill.name)) continue; // already active from restore
+
+      if (!this.activeSkills.has(sessionId)) {
+        this.activeSkills.set(sessionId, new Map());
+      }
+      this.activeSkills.get(sessionId)!.set(skill.name, {
+        name: skill.name,
+        processedBody: skill.body,
+        injection: skill.injection,
+      });
+    }
+    this.persistActiveSkills();
   }
 
   // ─── Capabilities ───────────────────────────────────────
@@ -525,6 +574,8 @@ export class SkillManagerPiece implements Piece {
             userInvocable: s.userInvocable,
             autoInvoke: s.autoInvoke,
             contextFork: s.contextFork,
+            injection: s.injection,
+            activation: s.activation,
             hint: s.argumentHint,
             triggers: s.triggers,
           })),

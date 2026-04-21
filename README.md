@@ -32,6 +32,8 @@ argument-hint: <required-arg>
 user-invocable: true
 auto-invoke: true
 context: false
+injection: system-prompt
+activation: on-demand
 shell: bash
 ---
 
@@ -59,6 +61,8 @@ Dynamic content via shell: !`date +%Y-%m-%d`
 | `user-invocable` | bool | true | Register as `/skill-name` slash command |
 | `auto-invoke` | bool | true | Show in `<available_skills>` catalog |
 | `context` | fork/false | false | `fork` dispatches to isolated actor |
+| `injection` | string | system-prompt | Where to inject: `system-prompt` (changes system prompt, may invalidate cache) or `message` (injected as conversation message, cache-friendly) |
+| `activation` | string | on-demand | When to activate: `on-demand` (explicit invocation) or `bootstrap` (auto-activated on startup for main session) |
 | `shell` | string | bash | Shell for `!`command`` preprocessing |
 
 ## Three invocation paths
@@ -78,6 +82,10 @@ Dynamic content via shell: !`date +%Y-%m-%d`
 **Token budget** — active skills are capped at ~25K tokens combined per session. Exceeding the budget rejects activation with a clear message.
 
 **Context forking** — skills with `context: fork` dispatch to a dedicated actor instead of injecting into the current session's context. The actor runs autonomously and reports back.
+
+**Injection modes** — `injection: system-prompt` (default) places the skill body in the system prompt dynamic block. `injection: message` injects it as a conversation message before each API call, preserving system prompt cache. Use `message` mode for frequently toggled or large skills to avoid cache invalidation.
+
+**Activation modes** — `activation: on-demand` (default) requires explicit invocation. `activation: bootstrap` auto-activates the skill for the main session on startup without needing a tool call.
 
 **State persistence** — active skills are saved to `~/.jarvis/state/active-skills.json` on every activation/deactivation and restored on restart.
 
