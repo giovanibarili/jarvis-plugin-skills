@@ -2,6 +2,10 @@
 
 Skill system for JARVIS — Claude Code-style `SKILL.md` files with per-session isolation, injection modes, and token budgets.
 
+## Requirements
+
+- **JARVIS** ≥ 0.1.0 (`@jarvis/core` ≥ 0.1.0)
+
 ## Install
 
 Ask JARVIS:
