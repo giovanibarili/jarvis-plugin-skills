@@ -12,7 +12,7 @@ Given the plugin is installed and enabled
 And ~/.jarvis/skills/ contains directories with SKILL.md files
 When I call skill_list
 Then the result should contain all valid skills from the directory
-And each skill should have name, description, active (boolean), userInvocable, autoInvoke, contextFork, injection, activation, and triggers
+And each skill should have name, description, active (boolean), userInvocable, autoInvoke, injection, activation, and triggers
 And the skill count should match the number of valid SKILL.md files in ~/.jarvis/skills/
 ```
 
@@ -137,80 +137,24 @@ And the message should contain "is not active"
 
 ## Feature: Per-Session Isolation
 
-### Scenario: Skills are isolated between sessions
+> Skills are stored per session ID internally. The main session uses "main". 
+> These scenarios verify isolation by inspecting internal state via jarvis_eval.
+
+### Scenario: Skills activated in main are not visible to other sessions
 
 ```gherkin
 Given skill "file-preview" is active in the "main" session
-When I dispatch actor "iso-test" with role "generic" and task "Call skill_list and report how many skills are active and their names"
-Then actor "iso-test" should report 0 active skills in its session
-And "file-preview" should remain active in the "main" session (verified via skill_list from main)
+When I inspect the internal activeSkills map for a different session ID
+Then that session should have 0 active skills
+And "file-preview" should remain active in "main"
 ```
 
 **Validation command:**
 ```
 1. skill_invoke(name="file-preview") → activates in main
-2. actor_dispatch(name="iso-test", role="generic", task="Call skill_list and report how many skills are active and their names")
-   → actor should report 0 active skills (file-preview is NOT active in its session)
-3. skill_list() from main → verify file-preview is still active
+2. skill_list() → verify file-preview is active, note activeCount
+3. jarvis_eval: inspect activeSkills map for session "other-session" → should be empty/undefined
 4. skill_deactivate(name="file-preview") → cleanup
-5. actor_kill(name="iso-test")
-```
-
-### Scenario: Actor can activate a skill in its own session
-
-```gherkin
-Given actor "skill-actor" exists with role "generic"
-When I dispatch a task to "skill-actor": "Call skill_invoke with name 'file-preview', then call skill_list and report your active skills count and names"
-Then actor "skill-actor" should report file-preview as active in its session
-And skill_list from the main session should NOT show file-preview as active (unless it was already active in main)
-```
-
-**Validation command:**
-```
-1. Ensure file-preview is NOT active in main: skill_deactivate(name="file-preview") (ignore error if not active)
-2. actor_dispatch(name="skill-actor", role="generic", task="Call skill_invoke with name 'file-preview'. Then call skill_list. Report: how many active skills, and their names.")
-   → actor should report 1 active skill: file-preview
-3. skill_list() from main → verify file-preview is NOT active in main (activeCount should not include it)
-4. actor_kill(name="skill-actor")
-```
-
-### Scenario: Actor deactivates a skill without affecting main
-
-```gherkin
-Given skill "file-preview" is active in both "main" and actor "cross-test" sessions
-When actor "cross-test" deactivates "file-preview"
-Then "file-preview" should remain active in the "main" session
-And "file-preview" should be inactive in actor "cross-test" session
-```
-
-**Validation command:**
-```
-1. skill_invoke(name="file-preview") → activates in main
-2. actor_dispatch(name="cross-test", role="generic", task="Call skill_invoke with name 'file-preview' to activate it. Then call skill_deactivate with name 'file-preview'. Then call skill_list and report your active skills count.")
-   → actor should report 0 active skills after deactivation
-3. skill_list() from main → verify file-preview is STILL active in main
-4. skill_deactivate(name="file-preview") → cleanup main
-5. actor_kill(name="cross-test")
-```
-
-### Scenario: Multiple actors have independent skill state
-
-```gherkin
-Given actors "actor-a" and "actor-b" both exist
-When "actor-a" activates skill "file-preview" and "actor-b" does NOT
-Then "actor-a" should report 1 active skill
-And "actor-b" should report 0 active skills
-And main session should be unaffected
-```
-
-**Validation command:**
-```
-1. actor_dispatch(name="actor-a", role="generic", task="Call skill_invoke with name 'file-preview'. Then call skill_list and report your active skill count and names.")
-   → should report 1 active skill: file-preview
-2. actor_dispatch(name="actor-b", role="generic", task="Call skill_list and report your active skill count and names.")
-   → should report 0 active skills
-3. actor_kill(name="actor-a")
-4. actor_kill(name="actor-b")
 ```
 
 ## Feature: State Persistence
@@ -358,7 +302,7 @@ Then "ARGUMENTS: some input" should be appended at the end of the body
 Given skills exist in the system
 When I call skill_list
 Then the response should contain:
-  - skills: array with name, description, active, userInvocable, autoInvoke, contextFork, injection, activation, triggers
+  - skills: array with name, description, active, userInvocable, autoInvoke, injection, activation, triggers
   - activeCount: number of currently active skills
   - activeTokens: estimated token count of all active skill bodies
   - limits: { maxSkills: 5, maxTokens: 25000 }
@@ -431,6 +375,81 @@ Then that skill should NOT be automatically active
 And it should only become active when explicitly invoked via skill_invoke or slash command
 ```
 
+## Feature: Compaction Promotion (message → system-prompt)
+
+### Scenario: Message-injected skill is promoted to system-prompt after compaction
+
+```gherkin
+Given a skill with injection: message is active in session "main"
+When a compaction event is published on the bus for session "main"
+Then the active skill's injection mode should change to "system-prompt" in memory
+And the skill body should appear in the system prompt (via session_get_system)
+And the skill should NOT be re-injected as ephemeral message anymore
+And skill_list should still show the skill as active
+```
+
+**Validation command:**
+```
+1. Create test skill with injection: message:
+   bash: mkdir -p ~/.jarvis/skills/test-msg-promote && cat > ~/.jarvis/skills/test-msg-promote/SKILL.md << 'EOF'
+   ---
+   name: test-msg-promote
+   description: Test skill for compaction promotion
+   injection: message
+   triggers: test-msg-promote
+   ---
+
+   This is a test skill that uses message injection mode.
+   EOF
+2. Wait 1 second for hot reload
+3. skill_invoke(name="test-msg-promote") → verify ok, "Injected as message"
+4. session_get_system(raw=true) → verify NO <active_skill name="test-msg-promote"> in system prompt
+5. Simulate compaction: jarvis_eval to publish system.event with event="compaction", data={sessionId:"main"}
+6. session_get_system(raw=true) → verify <active_skill name="test-msg-promote"> IS now in system prompt
+7. skill_list() → verify test-msg-promote is still active
+8. Cleanup: skill_deactivate(name="test-msg-promote") + rm -rf ~/.jarvis/skills/test-msg-promote
+```
+
+### Scenario: Re-activation after promotion restores original injection mode
+
+```gherkin
+Given a skill with injection: message was promoted to system-prompt after compaction
+When I deactivate and re-activate the skill
+Then the skill should revert to injection: message (original mode from SKILL.md)
+And the skill body should NOT appear in the system prompt
+And the skill should be injected as ephemeral message again
+```
+
+**Validation command:**
+```
+1. Create test skill with injection: message (as above)
+2. skill_invoke(name="test-msg-promote")
+3. Simulate compaction (as above) → skill is now system-prompt in memory
+4. skill_deactivate(name="test-msg-promote")
+5. skill_invoke(name="test-msg-promote") → verify "Injected as message" (not system-prompt)
+6. session_get_system(raw=true) → verify NO <active_skill name="test-msg-promote"> in system prompt
+7. Cleanup: skill_deactivate + rm -rf ~/.jarvis/skills/test-msg-promote
+```
+
+### Scenario: Only message-injected skills are promoted
+
+```gherkin
+Given skill "file-preview" (injection: system-prompt) is active
+And a skill with injection: message is active
+When a compaction event occurs
+Then the message-injected skill should be promoted to system-prompt
+And "file-preview" should remain unchanged (already system-prompt)
+```
+
+### Scenario: Promotion only affects the compacted session
+
+```gherkin
+Given a skill with injection: message is active in both "main" and "other-session" (via internal state)
+When a compaction event occurs for session "main" only
+Then the skill should be promoted to system-prompt in "main"
+And the skill should remain injection: message in "other-session" (unaffected)
+```
+
 ## Execution Checklist
 
 Run these commands in order to validate the full lifecycle:
@@ -465,22 +484,10 @@ Run these commands in order to validate the full lifecycle:
    mkdir + SKILL.md → wait → skill_list → verify present
    rm -rf → wait → skill_list → verify gone
 
-10. Per-session isolation — main skill NOT visible to actor:
-    skill_invoke(file-preview) in main → dispatch actor → actor reports 0 active → cleanup
+10. Per-session isolation:
+    skill_invoke(file-preview) in main → jarvis_eval inspect other session → should be empty → cleanup
 
-11. Actor activates skill in its own session:
-    dispatch actor → actor invokes file-preview → actor reports 1 active
-    → main skill_list shows file-preview NOT active → cleanup
-
-12. Actor deactivates without affecting main:
-    activate file-preview in main + in actor → actor deactivates
-    → main still has it active → cleanup
-
-13. Multiple actors independent state:
-    actor-a activates file-preview, actor-b does NOT
-    → actor-a reports 1 active, actor-b reports 0 → cleanup
-
-14. Injection mode — message:
+11. Injection mode — message:
     Create test skill with injection: message → skill_invoke → verify NOT in system prompt
     → verify IS active in skill_list → cleanup
 
@@ -492,4 +499,22 @@ Run these commands in order to validate the full lifecycle:
 
 17. Activation mode — on-demand (default):
     Verify skills without activation: bootstrap are NOT auto-activated
+
+18. Compaction promotion — message → system-prompt:
+    Create test skill with injection: message → skill_invoke → verify NOT in system prompt
+    → simulate compaction → verify IS in system prompt → verify still active
+    → cleanup
+
+19. Compaction promotion — re-activation restores original mode:
+    Create test skill with injection: message → skill_invoke → simulate compaction
+    → skill_deactivate → skill_invoke again → verify "Injected as message"
+    → verify NOT in system prompt → cleanup
+
+20. Compaction promotion — only affects message-injected skills:
+    Activate file-preview (system-prompt) + test-msg skill (message)
+    → simulate compaction → file-preview unchanged, test-msg promoted → cleanup
+
+21. Compaction promotion — only affects compacted session:
+    Activate test-msg skill in main + other session → simulate compaction for main only
+    → main promoted, other session unaffected → cleanup
 ```

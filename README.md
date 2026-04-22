@@ -1,6 +1,6 @@
 # jarvis-plugin-skills
 
-Skill system for JARVIS — Claude Code-style `SKILL.md` files with per-session isolation, context forking, and token budgets.
+Skill system for JARVIS — Claude Code-style `SKILL.md` files with per-session isolation, injection modes, and token budgets.
 
 ## Install
 
@@ -60,7 +60,6 @@ Dynamic content via shell: !`date +%Y-%m-%d`
 | `argument-hint` | string | — | Shown in slash menu and catalog |
 | `user-invocable` | bool | true | Register as `/skill-name` slash command |
 | `auto-invoke` | bool | true | Show in `<available_skills>` catalog |
-| `context` | fork/false | false | `fork` dispatches to isolated actor |
 | `injection` | string | system-prompt | Where to inject: `system-prompt` (changes system prompt, may invalidate cache) or `message` (injected as conversation message, cache-friendly) |
 | `activation` | string | on-demand | When to activate: `on-demand` (explicit invocation) or `bootstrap` (auto-activated on startup for main session) |
 | `shell` | string | bash | Shell for `!`command`` preprocessing |
@@ -75,13 +74,11 @@ Dynamic content via shell: !`date +%Y-%m-%d`
 
 ## Features
 
-**Per-session isolation** — each session (main, actor-alice, actor-bob) has its own set of active skills. Activating a skill in one session doesn't affect others.
+**Per-session isolation** — each session has its own set of active skills. Activating a skill in one session doesn't affect others.
 
 **Max active skills cap** — maximum 5 active skills per session, preventing context bloat.
 
 **Token budget** — active skills are capped at ~25K tokens combined per session. Exceeding the budget rejects activation with a clear message.
-
-**Context forking** — skills with `context: fork` dispatch to a dedicated actor instead of injecting into the current session's context. The actor runs autonomously and reports back.
 
 **Injection modes** — `injection: system-prompt` (default) places the skill body in the system prompt dynamic block. `injection: message` injects it as a conversation message before each API call, preserving system prompt cache. Use `message` mode for frequently toggled or large skills to avoid cache invalidation.
 

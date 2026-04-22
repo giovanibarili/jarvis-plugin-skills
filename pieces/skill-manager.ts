@@ -7,6 +7,7 @@ import type {
   PluginContext,
   EventBus,
   CapabilityHandler,
+  GraphHandle,
 } from "@jarvis/core";
 
 const execAsync = promisify(exec);
@@ -32,7 +33,6 @@ interface Skill {
   argumentHint?: string;
   userInvocable: boolean;
   autoInvoke: boolean;
-  contextFork: boolean;
   injection: InjectionMode;
   activation: ActivationMode;
   shell: string;
@@ -43,6 +43,8 @@ interface ActiveSkill {
   name: string;
   processedBody: string;
   injection: InjectionMode;
+  /** Original injection mode from SKILL.md — used to restore on re-activation */
+  originalInjection: InjectionMode;
 }
 
 // ─── YAML frontmatter parser ────────────────────────────────
@@ -241,6 +243,7 @@ export class SkillManagerPiece implements Piece {
   private watcher?: ReturnType<typeof watch>;
   private debounceTimer?: ReturnType<typeof setTimeout>;
   private started = false;
+  private graphHandle?: GraphHandle;
 
   constructor(ctx: PluginContext) {
     this.ctx = ctx;
@@ -301,10 +304,24 @@ export class SkillManagerPiece implements Piece {
     this.registerCapabilities();
     this.registerSlashCommands();
     this.startWatcher();
+    this.listenForCompaction();
+
+    // Register graph children — show active skills (main session) under this piece node
+    if (this.ctx.graphHandle) {
+      this.graphHandle = this.ctx.graphHandle(this.id);
+      this.updateGraphChildren();
+    }
   }
 
   async stop(): Promise<void> {
     this.persistActiveSkills();
+    if (this.compactionUnsub) {
+      this.compactionUnsub();
+      this.compactionUnsub = undefined;
+    }
+    if (this.graphHandle) {
+      this.graphHandle.setChildren(undefined);
+    }
     if (this.watcher) {
       this.watcher.close();
       this.watcher = undefined;
@@ -351,7 +368,6 @@ export class SkillManagerPiece implements Piece {
       argumentHint: metaStr(meta["argument-hint"]),
       userInvocable: metaBool(meta["user-invocable"], true),
       autoInvoke: metaBool(meta["auto-invoke"], true),
-      contextFork: metaBool(meta["context"], false) || metaStr(meta["context"]) === "fork",
       injection: (metaStr(meta.injection) === "message" ? "message" : "system-prompt") as InjectionMode,
       activation: (metaStr(meta.activation) === "bootstrap" ? "bootstrap" : "on-demand") as ActivationMode,
       shell: metaStr(meta.shell) ?? "bash",
@@ -364,11 +380,6 @@ export class SkillManagerPiece implements Piece {
   private async activateSkill(name: string, rawArgs: string, sessionId: string): Promise<{ ok: boolean; message: string }> {
     const skill = this.skills.get(name);
     if (!skill) return { ok: false, message: `Unknown skill: ${name}. Available: ${[...this.skills.keys()].join(", ")}` };
-
-    // context: fork — delegate to an actor instead of injecting into context
-    if (skill.contextFork) {
-      return this.forkSkill(skill, rawArgs, sessionId);
-    }
 
     // Check max active skills cap
     const sessionSkills = this.activeSkills.get(sessionId);
@@ -398,9 +409,10 @@ export class SkillManagerPiece implements Piece {
     if (!this.activeSkills.has(sessionId)) {
       this.activeSkills.set(sessionId, new Map());
     }
-    this.activeSkills.get(sessionId)!.set(name, { name, processedBody: processed, injection: skill.injection });
+    this.activeSkills.get(sessionId)!.set(name, { name, processedBody: processed, injection: skill.injection, originalInjection: skill.injection });
 
     this.persistActiveSkills();
+    this.updateGraphChildren();
 
     const injectionNote = skill.injection === "message"
       ? " Injected as message (cache-friendly)."
@@ -412,31 +424,6 @@ export class SkillManagerPiece implements Piece {
     };
   }
 
-  private async forkSkill(skill: Skill, rawArgs: string, sessionId: string): Promise<{ ok: boolean; message: string }> {
-    const args = parseArgs(rawArgs);
-    let processed = substituteArgs(skill.body, args, skill.dir, sessionId);
-    processed = await preprocessShell(processed, process.cwd(), skill.shell);
-
-    // Dispatch to an actor via bus
-    const actorName = `skill-${skill.name}`;
-    this.bus.publish({
-      channel: "ai.request",
-      source: "skill-manager",
-      target: `actor-${actorName}`,
-      text: processed,
-      replyTo: sessionId === "main" ? "main" : sessionId,
-      data: {
-        role: { name: `Skill: ${skill.name}`, systemPrompt: skill.description },
-        name: actorName,
-      },
-    } as any);
-
-    return {
-      ok: true,
-      message: `Skill **${skill.name}** forked to actor **${actorName}**. It will run autonomously and report back when done.`,
-    };
-  }
-
   private deactivateSkill(name: string, sessionId: string): { ok: boolean; message: string } {
     const sessionSkills = this.activeSkills.get(sessionId);
     if (!sessionSkills?.has(name)) return { ok: false, message: `Skill ${name} is not active.` };
@@ -444,6 +431,7 @@ export class SkillManagerPiece implements Piece {
     if (sessionSkills.size === 0) this.activeSkills.delete(sessionId);
 
     this.persistActiveSkills();
+    this.updateGraphChildren();
 
     return { ok: true, message: `Skill **${name}** deactivated.` };
   }
@@ -484,13 +472,13 @@ export class SkillManagerPiece implements Piece {
       for (const [sessionId, skillNames] of Object.entries(state)) {
         for (const name of skillNames) {
           const skill = this.skills.get(name);
-          if (!skill || skill.contextFork) continue; // don't restore forked skills
+          if (!skill) continue;
 
           // Re-activate without args (best effort — args aren't persisted)
           if (!this.activeSkills.has(sessionId)) {
             this.activeSkills.set(sessionId, new Map());
           }
-          this.activeSkills.get(sessionId)!.set(name, { name, processedBody: skill.body, injection: skill.injection });
+          this.activeSkills.get(sessionId)!.set(name, { name, processedBody: skill.body, injection: skill.injection, originalInjection: skill.injection });
         }
       }
     } catch {
@@ -506,8 +494,6 @@ export class SkillManagerPiece implements Piece {
     const sessionId = "main";
     for (const skill of this.skills.values()) {
       if (skill.activation !== "bootstrap") continue;
-      if (skill.contextFork) continue;
-
       const sessionSkills = this.activeSkills.get(sessionId);
       if (sessionSkills?.has(skill.name)) continue; // already active from restore
 
@@ -518,6 +504,7 @@ export class SkillManagerPiece implements Piece {
         name: skill.name,
         processedBody: skill.body,
         injection: skill.injection,
+        originalInjection: skill.injection,
       });
     }
     this.persistActiveSkills();
@@ -573,7 +560,6 @@ export class SkillManagerPiece implements Piece {
             active: sessionSkills?.has(s.name) ?? false,
             userInvocable: s.userInvocable,
             autoInvoke: s.autoInvoke,
-            contextFork: s.contextFork,
             injection: s.injection,
             activation: s.activation,
             hint: s.argumentHint,
@@ -617,6 +603,54 @@ export class SkillManagerPiece implements Piece {
   }
 
   // ─── File Watcher ───────────────────────────────────────
+
+  // ─── Compaction Listener ────────────────────────────────────
+  // On compaction, promote message-injected skills to system-prompt injection.
+  // This is a one-time in-memory promotion — the skill body moves from ephemeral
+  // messages to the system prompt, avoiding re-injection overhead post-compaction.
+  // On deactivation + re-activation, the original injection mode is restored.
+
+  private compactionUnsub?: () => void;
+
+  private listenForCompaction(): void {
+    this.compactionUnsub = this.bus.subscribe("system.event", (msg: any) => {
+      if (msg.event !== "compaction") return;
+      const sessionId = msg.data?.sessionId as string | undefined;
+      if (!sessionId) return;
+
+      const sessionSkills = this.activeSkills.get(sessionId);
+      if (!sessionSkills) return;
+
+      let promoted = 0;
+      for (const active of sessionSkills.values()) {
+        if (active.injection === "message") {
+          active.injection = "system-prompt";
+          promoted++;
+        }
+      }
+
+      if (promoted > 0) {
+        console.log(`[SkillManager] promoted ${promoted} message-injected skill(s) to system-prompt after compaction (session: ${sessionId})`);
+      }
+    });
+  }
+
+  private updateGraphChildren(): void {
+    if (!this.graphHandle) return;
+    const mainSkills = this.activeSkills.get("main");
+    const activeCount = mainSkills?.size ?? 0;
+    this.graphHandle.update({ meta: { skills: this.skills.size, active: activeCount } });
+    this.graphHandle.setChildren(() => {
+      const session = this.activeSkills.get("main");
+      if (!session || session.size === 0) return [];
+      return [...session.values()].map(s => ({
+        id: `skill-${s.name}`,
+        label: s.name,
+        status: "running",
+        meta: { injection: s.injection },
+      }));
+    });
+  }
 
   private startWatcher(): void {
     if (!existsSync(SKILLS_DIR)) return;
