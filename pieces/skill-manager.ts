@@ -1,5 +1,5 @@
-import { readFileSync, existsSync, readdirSync, writeFileSync, mkdirSync, watch } from "node:fs";
-import { join, basename } from "node:path";
+import { readFileSync, existsSync, readdirSync, watch } from "node:fs";
+import { join } from "node:path";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import type {
@@ -13,8 +13,7 @@ import type {
 const execAsync = promisify(exec);
 
 const SKILLS_DIR = join(process.env.HOME ?? "~", ".jarvis", "skills");
-const STATE_DIR = join(process.env.HOME ?? "~", ".jarvis", "state");
-const STATE_FILE = join(STATE_DIR, "active-skills.json");
+
 const SHELL_TIMEOUT_MS = 30_000;
 const MAX_ACTIVE_SKILLS = 5;
 const MAX_ACTIVE_TOKENS = 25_000; // ~100K chars / 4
@@ -299,7 +298,6 @@ export class SkillManagerPiece implements Piece {
     this.bus = bus;
 
     this.scanSkills();
-    this.restoreActiveSkills();
     this.activateBootstrapSkills();
     this.registerCapabilities();
     this.registerSlashCommands();
@@ -314,7 +312,6 @@ export class SkillManagerPiece implements Piece {
   }
 
   async stop(): Promise<void> {
-    this.persistActiveSkills();
     if (this.compactionUnsub) {
       this.compactionUnsub();
       this.compactionUnsub = undefined;
@@ -411,7 +408,6 @@ export class SkillManagerPiece implements Piece {
     }
     this.activeSkills.get(sessionId)!.set(name, { name, processedBody: processed, injection: skill.injection, originalInjection: skill.injection });
 
-    this.persistActiveSkills();
     this.updateGraphChildren();
 
     const injectionNote = skill.injection === "message"
@@ -430,7 +426,6 @@ export class SkillManagerPiece implements Piece {
     sessionSkills.delete(name);
     if (sessionSkills.size === 0) this.activeSkills.delete(sessionId);
 
-    this.persistActiveSkills();
     this.updateGraphChildren();
 
     return { ok: true, message: `Skill **${name}** deactivated.` };
@@ -444,46 +439,6 @@ export class SkillManagerPiece implements Piece {
       total += estimateTokens(skill.processedBody);
     }
     return total;
-  }
-
-  // ─── State Persistence ────────────────────────────────────
-
-  private persistActiveSkills(): void {
-    try {
-      if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
-
-      const state: Record<string, string[]> = {};
-      for (const [sessionId, skills] of this.activeSkills) {
-        state[sessionId] = [...skills.keys()];
-      }
-      writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
-    } catch {
-      // non-critical — state is ephemeral by nature
-    }
-  }
-
-  private restoreActiveSkills(): void {
-    try {
-      if (!existsSync(STATE_FILE)) return;
-
-      const raw = readFileSync(STATE_FILE, "utf-8");
-      const state: Record<string, string[]> = JSON.parse(raw);
-
-      for (const [sessionId, skillNames] of Object.entries(state)) {
-        for (const name of skillNames) {
-          const skill = this.skills.get(name);
-          if (!skill) continue;
-
-          // Re-activate without args (best effort — args aren't persisted)
-          if (!this.activeSkills.has(sessionId)) {
-            this.activeSkills.set(sessionId, new Map());
-          }
-          this.activeSkills.get(sessionId)!.set(name, { name, processedBody: skill.body, injection: skill.injection, originalInjection: skill.injection });
-        }
-      }
-    } catch {
-      // corrupted state file — start fresh
-    }
   }
 
   /**
@@ -507,7 +462,6 @@ export class SkillManagerPiece implements Piece {
         originalInjection: skill.injection,
       });
     }
-    this.persistActiveSkills();
   }
 
   // ─── Capabilities ───────────────────────────────────────
